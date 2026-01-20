@@ -43,7 +43,7 @@ def extract_code_blocks(text: str) -> list[dict]:
     return blocks
 
 @server.agent(
-    name="Coding with Canvas",
+    name="Coding Agent with Canvas",
     default_input_modes=["text", "text/plain"],
     default_output_modes=["text", "text/plain"],
     detail=AgentDetail(
@@ -160,11 +160,8 @@ Keep explanations brief."""
 
         yield trajectory.trajectory_metadata(title="Processing", content=f"Using {llm_config.api_model}")
 
-        # Build the full URL properly
         base_url = llm_config.api_base.rstrip('/')
         full_url = f"{base_url}/chat/completions"
-        
-        yield trajectory.trajectory_metadata(title="Debug URL", content=f"Calling: {full_url}")
 
         request_data = {
             "model": llm_config.api_model,
@@ -176,6 +173,11 @@ Keep explanations brief."""
         }
 
         response_text = ""
+        in_code_block = False
+        code_buffer = ""
+        language = ""
+        artifact_id = None
+        pre_code_text = ""
         
         async with httpx.AsyncClient(timeout=60.0) as client:
             headers = {
@@ -189,8 +191,6 @@ Keep explanations brief."""
                 json=request_data,
                 headers=headers
             ) as response:
-                yield trajectory.trajectory_metadata(title="Debug Status", content=f"HTTP {response.status_code}")
-                
                 async for line in response.aiter_lines():
                     if not line.startswith("data: "):
                         continue
@@ -206,39 +206,61 @@ Keep explanations brief."""
                             content = delta.get("content", "")
                             if content:
                                 response_text += content
-                                yield content
+                                
+                                # Check for code block start
+                                if not in_code_block and "```" in content:
+                                    # Extract language and start code block
+                                    parts = content.split("```", 1)
+                                    pre_code_text += parts[0]
+                                    if len(parts) > 1:
+                                        # Get language from first line
+                                        remaining = parts[1]
+                                        if '\n' in remaining:
+                                            lang_line, code_start = remaining.split('\n', 1)
+                                            language = lang_line.strip() or "text"
+                                            code_buffer = code_start
+                                        else:
+                                            language = remaining.strip() or "text"
+                                            code_buffer = ""
+                                        in_code_block = True
+                                        
+                                        # Create first artifact chunk
+                                        artifact = AgentArtifact(
+                                            name=f"{language.title()} Code",
+                                            parts=[TextPart(text=f"```{language}\n{code_buffer}")]
+                                        )
+                                        artifact_id = artifact.artifact_id
+                                        yield artifact
+                                        await context.store(artifact)
+                                elif in_code_block:
+                                    # Check if code block ends
+                                    if "```" in content:
+                                        parts = content.split("```", 1)
+                                        code_buffer += parts[0]
+                                        in_code_block = False
+                                        
+                                        # Send final artifact chunk
+                                        final_artifact = AgentArtifact(
+                                            artifact_id=artifact_id,
+                                            name=f"{language.title()} Code",
+                                            parts=[TextPart(text=parts[0])]
+                                        )
+                                        yield final_artifact
+                                    else:
+                                        # Continue code block
+                                        code_buffer += content
+                                        chunk_artifact = AgentArtifact(
+                                            artifact_id=artifact_id,
+                                            name=f"{language.title()} Code",
+                                            parts=[TextPart(text=content)]
+                                        )
+                                        yield chunk_artifact
+                                else:
+                                    # Regular text, just stream it
+                                    yield content
+                                    
                     except json.JSONDecodeError:
                         continue
-
-        code_blocks = extract_code_blocks(response_text)
-
-        if code_blocks:
-            primary_block = max(code_blocks, key=lambda b: len(b["code"]))
-            
-            artifact_name = f"{primary_block['language'].title()} Code"
-            
-            first_lines = primary_block["code"].split("\n")[:3]
-            for line in first_lines:
-                if match := re.match(r"^\s*[#//]\s*(.+)$", line):
-                    title = match.group(1).strip()
-                    if len(title) < 50 and not title.lower().startswith("copyright"):
-                        artifact_name = title
-                        break
-
-            code_with_formatting = f"```{primary_block['language']}\n{primary_block['code']}\n```"
-
-            artifact = AgentArtifact(
-                name=artifact_name,
-                parts=[TextPart(text=code_with_formatting)],
-            )
-            
-            yield trajectory.trajectory_metadata(
-                title="Code Generated",
-                content=f"{primary_block['language']} ({len(primary_block['code'])} chars)"
-            )
-
-            yield artifact
-            await context.store(artifact)
 
         msg = AgentMessage(text=response_text)
         await context.store(msg)
